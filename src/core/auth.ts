@@ -5,11 +5,14 @@
 import { homedir } from 'os';
 import { join } from 'path';
 import { promises as fs } from 'fs';
+import { randomUUID } from 'crypto';
 import { z } from 'zod';
 
 export interface AuthConfig {
   clientId: string;
-  clientSecret: string;  // Required for script apps
+  clientSecret: string;  // Required for script apps; empty for installed apps
+  installedApp?: boolean; // Installed-app client (no secret by design)
+  deviceId?: string;      // For the installed_client grant
   username?: string;     // For script app auth
   password?: string;     // Never stored, only used temporarily
   accessToken?: string;
@@ -83,10 +86,21 @@ export class AuthManager {
     const username = this.cleanEnvVar(process.env.REDDIT_USERNAME);
     const password = this.cleanEnvVar(process.env.REDDIT_PASSWORD);
     const userAgent = this.cleanEnvVar(process.env.REDDIT_USER_AGENT);
+    const refreshToken = this.cleanEnvVar(process.env.REDDIT_REFRESH_TOKEN);
 
-    // Need at least client ID and secret for script apps
-    if (!clientId || !clientSecret) {
+    if (!clientId) {
       return null;
+    }
+
+    // No secret: an installed app, which Reddit only allows the installed_client and refresh_token grants
+    if (!clientSecret) {
+      return {
+        clientId,
+        clientSecret: '',
+        installedApp: true,
+        refreshToken,
+        userAgent: userAgent || 'RedditBuddy/1.0 (by /u/karanb192)'
+      };
     }
 
     return {
@@ -196,7 +210,7 @@ export class AuthManager {
   isAuthenticated(): boolean {
     return this.config !== null &&
            this.config.clientId !== undefined &&
-           this.config.clientSecret !== undefined;
+           (!!this.config.clientSecret || !!this.config.installedApp);
   }
 
   /**
@@ -260,7 +274,7 @@ export class AuthManager {
    * Internal implementation of token refresh (protected by lock)
    */
   private async doRefreshAccessToken(): Promise<void> {
-    if (!this.config?.clientId || !this.config?.clientSecret) {
+    if (!this.config?.clientId || (!this.config.clientSecret && !this.config.installedApp)) {
       throw new Error('No client credentials configured');
     }
 
@@ -270,7 +284,18 @@ export class AuthManager {
 
       let body: string;
 
-      if (this.config.username && this.config.password) {
+      if (this.config.installedApp && this.config.refreshToken) {
+        body = new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: this.config.refreshToken,
+        }).toString();
+      } else if (this.config.installedApp) {
+        this.config.deviceId ||= randomUUID();
+        body = new URLSearchParams({
+          grant_type: 'https://oauth.reddit.com/grants/installed_client',
+          device_id: this.config.deviceId,
+        }).toString();
+      } else if (this.config.username && this.config.password) {
         // Use password grant for authenticated requests (100 req/min)
         body = new URLSearchParams({
           grant_type: 'password',
@@ -423,6 +448,9 @@ export class AuthManager {
     if (!this.isAuthenticated()) {
       return 'Anonymous';
     }
+    if (this.config?.installedApp) {
+      return this.config.refreshToken ? 'Installed-App (user refresh token)' : 'Installed-App (app-only)';
+    }
     return this.hasFullAuth() ? 'Authenticated' : 'App-Only';
   }
 
@@ -439,7 +467,8 @@ export class AuthManager {
   private isValidConfig(config: any): config is AuthConfig {
     return config &&
            typeof config.clientId === 'string' && config.clientId.length > 0 &&
-           typeof config.clientSecret === 'string' && config.clientSecret.length > 0;
+           typeof config.clientSecret === 'string' &&
+           (config.clientSecret.length > 0 || config.installedApp === true);
   }
 
   /**
